@@ -1,0 +1,63 @@
+Yes—this cuVS checkout contains a separate, complete IVF-RaBitQ compression/index-construction flow.
+
+The IVF-RaBitQ path is:
+
+```text
+Input vectors
+    ↓
+Balanced K-means
+    ↓
+Assign each vector to an IVF list
+    ↓
+Subtract its list centroid
+    ↓
+Pad dimensions to a multiple of 64
+    ↓
+Apply IVF-specific random rotation
+    ↓
+RaBitQ residual quantization
+    ├── Packed 1-bit sign codes
+    ├── Packed extended-bit magnitude codes
+    ├── Per-vector scoring factors
+    └── Original vector IDs
+    ↓
+Store codes by IVF list + rotated centroids
+    ↓
+Search directly in compressed form / serialize index
+```
+
+The public API is in [ivf_rabitq.hpp](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/include/cuvs/neighbors/ivf_rabitq.hpp:34). It supports 1–9 bits per dimension, configurable IVF list count, balanced K-means iterations, fast quantization, and streaming construction.
+
+The actual index build is in [ivf_rabitq.cu](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq.cu:27):
+
+- Balanced K-means training occurs at [line 129](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq.cu:129).
+- Vector-to-list prediction follows.
+- IVF-RaBitQ construction is called at [line 168](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq.cu:168).
+
+The compressed index implementation is in [ivf_gpu.cu](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cu:39). It stores packed short codes, extended codes, factors, vector IDs, list metadata, and rotated centroids. Per-list quantization is invoked at [line 843](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cu:843).
+
+An important distinction:
+
+| Current extension | IVF-RaBitQ index |
+|---|---|
+| Uses public preprocessing `rabitq::transform` | Uses internal `DataQuantizerGPU` |
+| Codes represented per coordinate | Codes packed into sign and extended-bit streams |
+| Reconstruction uses `delta` and `vl` | Stores search/scoring-specific factors |
+| Standalone vectors | Residuals grouped by IVF centroid |
+| Public configurable rotator | Internal dense IVF rotator |
+| Padding associated with standalone pipeline | Pads dimension to a multiple of 64 |
+
+Therefore, the current [rabitq_decompression.hpp](/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/extensions/rabitq_decompression/include/rabitq_decompression.hpp:25) does **not directly decompress an IVF-RaBitQ index**. It reverses the standalone preprocessing compression format used by our benchmark.
+
+Supporting IVF reconstruction would require another adapter under `extensions/` that:
+
+1. Reads the IVF list metadata and stored IDs.
+2. Unpacks the short sign codes.
+3. Unpacks the extended-bit codes.
+4. Reconstructs each rotated residual using the IVF factors.
+5. Adds the corresponding rotated centroid.
+6. Applies the inverse IVF rotation.
+7. Removes 64-dimension padding.
+8. Restores original vector ordering using the stored IDs.
+
+Also, keeping the compatibility change in `kmeans_balanced.cuh` makes sense for IVF-RaBitQ: its build path explicitly calls balanced K-means. The `brute_force_prefiltered.cu` change is unrelated to IVF-RaBitQ itself, although it may still be needed when building the complete test suite. No files were changed during this check.

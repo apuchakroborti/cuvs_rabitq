@@ -131,26 +131,76 @@ void transform_impl(raft::resources const& res,
                     raft::device_vector_view<float, int64_t> delta,
                     raft::device_vector_view<float, int64_t> vl)
 {
+  // Step 1: Read the batch size from the input view. CodeT was selected by the
+  // public overload: uint8_t stores 1-8 bits/dimension; uint16_t stores 9 bits.
   const int64_t n_rows = dataset.extent(0);
+
+  // Step 2: Verify that the quantizer and rotator are initialized and agree on
+  // padded_dim. padded_dim is the rotation/quantization width and may exceed q.dim.
   check_peers(q, rot);
+
+  // Step 3: Reject a row count that cannot be represented by downstream CUDA
+  // launch parameters. A zero-row batch is valid and is handled below.
   check_rows(n_rows);
+
+  // Step 4: The caller supplies unpadded rows of exactly q.dim values. Padding
+  // to q.padded_dim is performed later by prepare_residuals().
   RAFT_EXPECTS(dataset.extent(1) == q.dim,
                "rabitq::transform: dataset.extent(1) must equal quantizer.dim");
+
+  // Step 5: Validate output storage. codes is n_rows x padded_dim and CodeT must
+  // hold ex_bits + 1 total bits; delta and vl contain one FP32 value per row.
   check_codes(q, n_rows, codes);
   check_delta_vl(n_rows, delta, vl);
+
+  // Step 6: A centroid is optional. When supplied, it must have the original
+  // unpadded width; the pipeline pads and rotates it with the same rotator.
   if (centroid.has_value()) {
     RAFT_EXPECTS(centroid->extent(0) == q.dim,
                  "rabitq::transform: centroid must hold quantizer.dim elements");
   }
+
+  // Step 7: Shape validation is complete; no allocation or kernel is needed for
+  // an empty batch.
   if (n_rows == 0) { return; }
 
+  // Step 8: Use the caller's RAFT CUDA stream and workspace memory resource so
+  // temporary allocation and all following kernels remain ordered on that stream.
   auto stream    = raft::resource::get_cuda_stream(res);
   auto workspace = raft::resource::get_workspace_resource_ref(res);
+
+  // Step 9: Allocate the temporary n_rows x padded_dim working matrix named
+  // "residuals". Here residual does NOT mean quantization error or the difference
+  // between original and reconstructed data. For each input row x and optional
+  // centroid c, the next layer writes:
+  //
+  //   centroid absent: residual = rotate(pad(x))
+  //   centroid present: residual = rotate(pad(x)) - rotate(pad(c))
+  //                                 = rotate(pad(x - c)) for this linear rotation
+  //
+  // Thus, in the standalone benchmark (centroid == std::nullopt), this buffer is
+  // simply the padded, randomly rotated input used by the quantization kernel.
+  // It is scratch storage only and is not returned to the caller.
   rmm::device_uvector<float> residuals(
     static_cast<size_t>(n_rows) * static_cast<size_t>(q.padded_dim), stream, workspace);
+
+  // Step 10: Allocate one padded rotated-centroid row only when a centroid exists.
+  // It is subtracted from every rotated dataset row while forming residuals.
   rmm::device_uvector<float> rotated_centroid(
     centroid.has_value() ? static_cast<size_t>(q.padded_dim) : 0, stream, workspace);
 
+  // Step 11: Execute the two compression sub-stages in quantize_data():
+  //   A. prepare_residuals() pads/rotates the dataset and optionally subtracts
+  //      the rotated centroid, filling the temporary residuals matrix above.
+  //   B. quantize_fused_on_residuals() normalizes and quantizes each residual row,
+  //      writing codes plus delta/vl. Decompression reconstructs rotated values as
+  //      reconstructed_residual[j] = codes[j] * delta[row] + vl[row].
+  // q.params_quantizer controls extra bits, fast/exhaustive scale selection, and
+  // the delta formula; coarse_samples/fine_samples control non-fast scale search.
+  // Next: detail::quantize_data()
+  // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/pipeline.cu)
+  // starts the compression implementation: form rotated residuals, then quantize
+  // them into codes plus the per-row delta/vl reconstruction parameters.
   detail::quantize_data(res,
                         dataset.data_handle(),
                         static_cast<size_t>(n_rows),
@@ -168,6 +218,12 @@ void transform_impl(raft::resources const& res,
                         static_cast<int>(q.params_quantizer.delta_mode),
                         static_cast<int>(q.params_quantizer.coarse_samples),
                         static_cast<int>(q.params_quantizer.fine_samples));
+
+  // Step 12: On return, codes/delta/vl remain in caller-owned device buffers.
+  // residuals and rotated_centroid are released when this scope ends. In the
+  // standalone benchmark this entire transform_impl() call is between CUDA
+  // events, although CUDA-event elapsed time records stream work rather than
+  // ordinary host-side validation and object-management instructions.
 }
 
 template <typename CodeT>
@@ -376,6 +432,34 @@ void rotate(raft::resources const& res,
   detail::rotate(res, ref, in.data_handle(), out.data_handle(), n_rows);
 }
 
+// OVERLOAD-SELECTION MAP FOR THE FOUR transform() METHODS BELOW
+//
+// There is no runtime "standalone versus IVF" branch in this file. C++ overload
+// resolution selects a method from the output arguments supplied by the caller:
+//   * (codes, delta, vl) -> reconstruction-oriented transform_impl(). This is the
+//     family called by the standalone benchmark's transform_batch().
+//   * (codes, factors[n_rows][3]) -> search-oriented transform_full_impl(), which
+//     emits (f_add, f_rescale, f_error). It is a reusable full-factor API, but the
+//     current IVF-RaBitQ build benchmark does NOT call it.
+// Within either family, codes<uint8_t> selects the uint8_t overload and
+// codes<uint16_t> selects the uint16_t overload at compile time.
+//
+// Standalone selection occurs in run<CodeT>()
+// (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq_scripts/rabitq_compress_bench.cu):
+// bits_per_dim <= 8 -> CodeT=uint8_t; bits_per_dim == 9 -> CodeT=uint16_t.
+// That caller also passes delta and vl, so it selects one of the first two methods.
+//
+// The current IVF-RaBitQ flow is separate:
+// build_profiled()
+// (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/extensions/ivf_rabitq_build_profiling/src/ivf_rabitq_build_profiling.cu)
+// -> IVFGPU::construct_on_gpu()/IVFGPU::quantize_cluster()
+// (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cu)
+// -> DataQuantizerGPU::quantize_batch_opt()
+// (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/neighbors/ivf_rabitq/gpu_index/quantizer_gpu.cu).
+// Therefore none of these four preprocessing transform() overloads is selected
+// by the current IVF build path unless that path is explicitly refactored to call one.
+
+// STANDALONE RABITQ: delta/vl output family, uint8 code storage (1-8 bits/dimension).
 void transform(raft::resources const& res,
                quantizer const& quantizer,
                rotator const& rotator,
@@ -385,9 +469,15 @@ void transform(raft::resources const& res,
                raft::device_vector_view<float, int64_t> delta,
                raft::device_vector_view<float, int64_t> vl)
 {
+  // Selected by transform_batch() when run<uint8_t>() supplies uint8 codes plus
+  // vector outputs delta and vl. Next: transform_impl()
+  // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/rabitq.cu)
+  // validates all views, allocates compression scratch space, and dispatches
+  // the core pipeline for uint8 codes.
   transform_impl(res, quantizer, rotator, dataset, centroid, codes, delta, vl);
 }
 
+// STANDALONE RABITQ: delta/vl output family, uint16 code storage (9 bits/dimension).
 void transform(raft::resources const& res,
                quantizer const& quantizer,
                rotator const& rotator,
@@ -397,9 +487,16 @@ void transform(raft::resources const& res,
                raft::device_vector_view<float, int64_t> delta,
                raft::device_vector_view<float, int64_t> vl)
 {
+  // Selected by transform_batch() when run<uint16_t>() supplies uint16 codes plus
+  // vector outputs delta and vl. Next: transform_impl()
+  // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/rabitq.cu)
+  // handles codes wider than eight bits (for example, 9 bits), allocates scratch,
+  // and dispatches the core compression pipeline.
   transform_impl(res, quantizer, rotator, dataset, centroid, codes, delta, vl);
 }
 
+// GENERIC FULL-FACTOR API: uint8 code storage plus three search factors per row.
+// This signature is not called by the current standalone or IVF benchmark flow.
 void transform(raft::resources const& res,
                quantizer const& quantizer,
                rotator const& rotator,
@@ -408,9 +505,15 @@ void transform(raft::resources const& res,
                raft::device_matrix_view<uint8_t, int64_t, raft::row_major> codes,
                raft::device_matrix_view<float, int64_t, raft::row_major> factors)
 {
+  // Next: transform_full_impl()
+  // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/rabitq.cu)
+  // validates the factor matrix, prepares rotated residuals, and emits uint8
+  // codes with (f_add, f_rescale, f_error) for approximate-distance search.
   transform_full_impl(res, quantizer, rotator, dataset, centroid, codes, factors);
 }
 
+// GENERIC FULL-FACTOR API: uint16 code storage plus three search factors per row.
+// This signature is not called by the current standalone or IVF benchmark flow.
 void transform(raft::resources const& res,
                quantizer const& quantizer,
                rotator const& rotator,
@@ -419,6 +522,10 @@ void transform(raft::resources const& res,
                raft::device_matrix_view<uint16_t, int64_t, raft::row_major> codes,
                raft::device_matrix_view<float, int64_t, raft::row_major> factors)
 {
+  // Next: transform_full_impl()
+  // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/rabitq.cu)
+  // validates the factor matrix, prepares rotated residuals, and emits uint16
+  // codes with (f_add, f_rescale, f_error) for approximate-distance search.
   transform_full_impl(res, quantizer, rotator, dataset, centroid, codes, factors);
 }
 

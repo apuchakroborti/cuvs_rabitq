@@ -280,6 +280,9 @@ static void launch_quantize_fused(
     constexpr int nwarps = block / 32;
 
     size_t q_smem = (padded_dim + 2 * nwarps) * sizeof(float);
+    // Next: sa_quantize_fused_kernel()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/quantize.cu)
+    // uses one block per residual row and completes codes plus delta/vl emission.
     sa_quantize_fused_kernel<CodeT, block, false><<<iN, block, q_smem, stream>>>(
         d_residual, d_total_code, iN, iD, iB, const_scaling_factor, use_fast,
         coarse_samples, fine_samples,
@@ -294,6 +297,9 @@ void quantize_fused_on_residuals(
     uint16_t* d_total_code, float* d_delta, float* d_vl, int delta_mode,
     int coarse_samples, int fine_samples)
 {
+    // Next: launch_quantize_fused()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/quantize.cu)
+    // preserves uint16 codes and dispatches the final fused quantization kernel.
     launch_quantize_fused(stream,
                           d_residuals, N, static_cast<uint32_t>(padded_dim), ex_bits,
                           const_scaling_factor, use_fast, delta_mode,
@@ -308,6 +314,9 @@ void quantize_fused_on_residuals(
     uint8_t* d_total_code, float* d_delta, float* d_vl, int delta_mode,
     int coarse_samples, int fine_samples)
 {
+    // Next: launch_quantize_fused()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/quantize.cu)
+    // handles one-through-eight-bit codes and dispatches the final fused kernel.
     launch_quantize_fused(stream,
                           d_residuals, N, static_cast<uint32_t>(padded_dim), ex_bits,
                           const_scaling_factor, use_fast, delta_mode,

@@ -187,9 +187,15 @@ void rotate_fht_kac(cudaStream_t stream,
   const auto p = derive_fht_kac(D);
   if (p.trunc_dim == D) {
     const float total_scale = p.fac * p.fac * p.fac * p.fac;
+    // Next: fht::dispatch_fused_rotate()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+    // selects and launches the power-of-two FHT-Kac kernel, completing forward rotation.
     fht::dispatch_fused_rotate(
       in, out, d_flip, static_cast<int>(N), p.log_n, total_scale, stream);
   } else {
+    // Next: fht::dispatch_fused_rotate_nonpow2()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+    // selects the padded non-power-of-two FHT-Kac kernel and completes forward rotation.
     fht::dispatch_fused_rotate_nonpow2(in,
                                        out,
                                        d_flip,
@@ -206,9 +212,15 @@ void rotate(
   raft::resources const& res, rotator_ref const& rot, const float* in, float* out, int64_t N)
 {
   if (rot.use_fht_kac) {
+    // Next: rotate_fht_kac()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/rotator.cu)
+    // dispatches the structured randomized transform used by forward rotation.
     rotate_fht_kac(
       raft::resource::get_cuda_stream(res), rot.flip_bits, in, out, N, rot.padded_dim);
   } else {
+    // Next: rotate_matmul()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/rotator.cu)
+    // applies dense random rotation with cuBLAS SGEMM, completing forward rotation.
     rotate_matmul(res, rot.rotation_matrix, in, out, N, rot.padded_dim);
   }
 }

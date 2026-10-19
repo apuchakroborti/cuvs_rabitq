@@ -116,30 +116,72 @@ __global__ void fht_kac_rotate_warp_kernel(
     const uint8_t* __restrict__ flip,
     int N, float total_scale)
 {
+    // Mathematical operation performed by this power-of-two kernel:
+    //
+    //   output = total_scale * H*D3 * H*D2 * H*D1 * H*D0 * input
+    //
+    // H is the unnormalized kDim x kDim Walsh-Hadamard matrix, and each Dr is
+    // a diagonal matrix whose diagonal entries are independently chosen +1/-1.
+    // Since H^T H = kDim*I, H/sqrt(kDim) is orthogonal. Each Dr is also
+    // orthogonal because Dr^T Dr = I. rotate_fht_kac() supplies
+    // total_scale = (1/sqrt(kDim))^4, so the complete implicit product is an
+    // orthogonal transform (up to floating-point rounding). No dense random
+    // orthogonal matrix is constructed or stored.
+    //
+    // `flip` is NOT an array of matrix values. init_state_fht_kac() fills
+    // 4*kDim random bits, packed eight per uint8_t. A random byte in [0,255]
+    // therefore represents eight independent binary sign decisions:
+    // bit 0 -> +1 or -1 for one coordinate, bit 1 -> the next coordinate, etc.
+    // Across four rounds these bits encode D0, D1, D2, and D3. Orthogonality
+    // depends only on every diagonal value being +/-1, not on the numeric byte
+    // value itself being an orthogonal matrix entry.
+
+    // Step 1: Resolve all transform dimensions at compile time. kDim is the
+    // vector width D=2^kLogN. Each warp has 32 lanes; every lane owns kC float4
+    // registers, so 32*kC*4 == kDim values are held entirely in registers.
     constexpr int kDim  = 1 << kLogN;
     constexpr int kC    = kDim / 128;   // float4 registers per lane
     constexpr int kLogC = clog2(kC);
+
+    // One round needs one sign bit per coordinate. Reinterpreting the packed
+    // byte storage as uint32_t lets one load retrieve 32 coordinate signs.
     constexpr int kWordsPerRound = kDim / 32;
     static_assert(kLogN >= 7, "warp kernel needs at least one float4 per lane");
 
+    // Step 2: Identify this thread's lane and vector. A CUDA block contains
+    // blockDim/32 independent warps, and each warp rotates one complete row.
     const int lane   = threadIdx.x & 31;
     const int vec_id = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (vec_id >= N) return;
 
+    // Step 3: View the same packed flip bytes as 32-bit words. This changes only
+    // how bits are loaded; it does not convert the values into numeric weights.
     const uint32_t* flip32 = reinterpret_cast<const uint32_t*>(flip);
 
+    // Step 4: Load one vector into registers using coalesced float4 accesses.
+    // Lane l owns float4 number (32*c+l), corresponding to four consecutive
+    // coordinates beginning at 128*c+4*l. In-place input/output is safe because
+    // the whole input row is loaded before this warp writes its output row.
     const float4* vin = reinterpret_cast<const float4*>(input + (size_t)vec_id * kDim);
     float4 x[kC];
     #pragma unroll
     for (int c = 0; c < kC; ++c) x[c] = vin[c * 32 + lane];
 
+    // Step 5: Locate this lane's four adjacent sign bits within a 32-bit word.
+    // Lanes 0-7 consume word 0, lanes 8-15 word 1, and so on. Within its word,
+    // each lane consumes a four-bit nibble for its float4 coordinates.
     const int bit_shift = 4 * (lane & 7);   // this lane's 4 flip bits inside the word
     const int word_off  = lane >> 3;
 
+    // Step 6: Apply four randomized normalized-Hadamard rounds. Normalization
+    // is postponed until Step 7 because scalar factors commute with all rounds.
     #pragma unroll
     for (int round = 0; round < 4; ++round) {
-        // Sign flip (element e uses bit e%32 of word e/32; all four of this
-        // lane's bits sit in one word).
+        // Step 6a -- Apply Dr: read the four packed sign bits assigned to this
+        // float4. Element e uses bit (e%32) of word (e/32) for this round.
+        // flip_sign_bit(v,0) leaves v unchanged; flip_sign_bit(v,1) toggles the
+        // IEEE-754 sign bit, producing exactly -v without changing its magnitude.
+        // This is equivalent to multiplication by one diagonal +/-1 matrix Dr.
         #pragma unroll
         for (int c = 0; c < kC; ++c) {
             uint32_t w = __ldg(&flip32[round * kWordsPerRound + 4 * c + word_off]) >> bit_shift;
@@ -149,7 +191,8 @@ __global__ void fht_kac_rotate_warp_kernel(
             x[c].w = flip_sign_bit(x[c].w, (w >> 3)  & 1u);
         }
 
-        // Levels 0-1: inside each float4.
+        // Step 6b -- Apply Hadamard levels 0-1 inside each float4. Every pair
+        // (a,b) becomes (a+b,a-b), which is the two-point Hadamard butterfly.
         #pragma unroll
         for (int c = 0; c < kC; ++c) {
             float a, b;
@@ -159,7 +202,9 @@ __global__ void fht_kac_rotate_warp_kernel(
             a = x[c].y; b = x[c].w; x[c].y = a + b; x[c].w = a - b;
         }
 
-        // Levels 2-6: element bit (lv+2) == lane bit lv -> warp shuffles.
+        // Step 6c -- Apply Hadamard levels 2-6 across lanes. XOR shuffle fetches
+        // the butterfly partner from lane^(1<<lv); sgn selects sum for the lower
+        // half and difference for the upper half. No shared memory is required.
         #pragma unroll
         for (int lv = 0; lv < 5; ++lv) {
             const int mask  = 1 << lv;
@@ -174,8 +219,10 @@ __global__ void fht_kac_rotate_warp_kernel(
             }
         }
 
-        // Levels 7+: across chunk registers, in-thread. Pair p of a level
-        // sits at offset (p % stride) inside butterfly group (p / stride).
+        // Step 6d -- Apply any remaining Hadamard levels across this lane's
+        // float4 registers. Both butterfly operands now belong to the same
+        // thread, so ordinary register additions/subtractions finish H*Dr.
+        // Pair p sits at (p%stride) inside group (p/stride).
         #pragma unroll
         for (int lv = 0; lv < kLogC; ++lv) {
             const int stride = 1 << lv;
@@ -192,6 +239,9 @@ __global__ void fht_kac_rotate_warp_kernel(
         }
     }
 
+    // Step 7: Apply the accumulated normalization for all four Hadamard rounds
+    // and store the rotated row. For D=kDim, total_scale=D^-2, making the four
+    // unnormalized H operations equivalent to four H/sqrt(D) operations.
     float4* vout = reinterpret_cast<float4*>(output + (size_t)vec_id * kDim);
     #pragma unroll
     for (int c = 0; c < kC; ++c) {
@@ -602,6 +652,9 @@ inline void launch_warp_rotate(const float* input, float* output,
                                 float total_scale, cudaStream_t stream) {
     const int vecs_per_block = kWarpKernelBlock / 32;
     const int grid = (N + vecs_per_block - 1) / vecs_per_block;
+    // Next: fht_kac_rotate_warp_kernel()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+    // completes power-of-two FHT-Kac rotation with one warp per vector.
     fht_kac_rotate_warp_kernel<kLogN><<<grid, kWarpKernelBlock, 0, stream>>>(
         input, output, flip, N, total_scale);
     RAFT_CUDA_TRY(cudaGetLastError());
@@ -617,6 +670,9 @@ inline void launch_coop_rotate(const float* input, float* output,
     auto kernel = &fht_kac_rotate_coop_kernel<kLogN>;
     if (smem >= 48 * 1024)
         RAFT_CUDA_TRY(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    // Next: fht_kac_rotate_coop_kernel()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+    // completes power-of-two FHT-Kac rotation with one cooperative block per vector.
     kernel<<<N, kThreads, smem, stream>>>(input, output, flip, N, total_scale);
     RAFT_CUDA_TRY(cudaGetLastError());
 }
@@ -632,6 +688,9 @@ inline void launch_coop_rotate_nonpow2(const float* input, float* output,
     auto kernel = &fht_kac_rotate_coop_nonpow2_kernel<kLogTrunc>;
     if (smem >= 48 * 1024)
         RAFT_CUDA_TRY(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    // Next: fht_kac_rotate_coop_nonpow2_kernel()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+    // completes padded non-power-of-two rotation with a cooperative block per vector.
     kernel<<<N, kThreads, smem, stream>>>(input, output, flip, N, padded_dim, fac, final_scale);
     RAFT_CUDA_TRY(cudaGetLastError());
 }
@@ -676,6 +735,9 @@ inline void dispatch_fused_rotate_nonpow2(const float* input, float* output,
             dispatch_p32<kMinP32, kMaxP32>(padded_dim / 32, [&](auto KP) {
                 const int vecs_per_block = kWarpKernelBlock / 32;
                 const int grid = (N + vecs_per_block - 1) / vecs_per_block;
+                // Next: fht_kac_rotate_warp_nonpow2_kernel()
+                // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/fht.cuh)
+                // completes padded non-power-of-two rotation with one warp per vector.
                 fht_kac_rotate_warp_nonpow2_kernel<kLogT, KP.value>
                     <<<grid, kWarpKernelBlock, 0, stream>>>(
                         input, output, flip, N, fac, final_scale);

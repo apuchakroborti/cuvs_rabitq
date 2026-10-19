@@ -201,7 +201,8 @@ class PrefilteredBruteForceOnBitmapTest
       auto src    = out_src.data();
       auto dst    = out_dst.data();
       auto bitmap = filter_d.data();
-      rmm::device_scalar<index_t> nnz(0, stream);
+      rmm::device_scalar<index_t> nnz(stream);
+      nnz.set_value_to_zero_async(stream);
       auto nnz_view = raft::make_device_scalar_view<index_t>(nnz.data());
       auto filter_view =
         raft::make_device_vector_view<const uint32_t, index_t>(filter_d.data(), filter_d.size());
@@ -619,7 +620,8 @@ class PrefilteredBruteForceOnBitsetTest
       auto src    = out_src.data();
       auto dst    = out_dst.data();
       auto bitset = filter_d.data();
-      rmm::device_scalar<index_t> nnz(0, stream);
+      rmm::device_scalar<index_t> nnz(stream);
+      nnz.set_value_to_zero_async(stream);
       auto nnz_view = raft::make_device_scalar_view<index_t>(nnz.data());
       auto filter_view =
         raft::make_device_vector_view<const uint32_t, index_t>(filter_d.data(), filter_d.size());

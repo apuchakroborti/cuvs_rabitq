@@ -54,6 +54,9 @@ void pad_and_rotate(raft::resources const& res,
                     rotator_ref const& rotator, float* d_dst) {
     const size_t D = static_cast<size_t>(rotator.padded_dim);
     if (dim == D) {
+        // Next: rotate()
+        // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/rotator.cu)
+        // completes the forward random-rotation stage directly because no padding is needed.
         rotate(res, rotator, d_src, d_dst, static_cast<int64_t>(N));
         return;
     }
@@ -66,6 +69,9 @@ void pad_and_rotate(raft::resources const& res,
                                                      static_cast<int>(N), static_cast<int>(dim),
                                                      static_cast<int>(D));
         RAFT_CUDA_TRY(cudaGetLastError());
+        // Next: rotate()
+        // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/rotator.cu)
+        // rotates the zero-padded rows in place, completing residual preparation.
         rotate(res, rotator, d_dst, d_dst, static_cast<int64_t>(N));
     } else {
         rmm::device_uvector<float> d_tmp(
@@ -74,6 +80,9 @@ void pad_and_rotate(raft::resources const& res,
                                                      static_cast<int>(N), static_cast<int>(dim),
                                                      static_cast<int>(D));
         RAFT_CUDA_TRY(cudaGetLastError());
+        // Next: rotate()
+        // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/rotator.cu)
+        // applies the dense out-of-place rotation and completes residual preparation.
         rotate(res, rotator, d_tmp.data(), d_dst, static_cast<int64_t>(N));
     }
 }
@@ -110,8 +119,14 @@ void quantize_data_impl(raft::resources const& res,
                         CodeT* d_total_code, float* d_delta, float* d_vl,
                         float* d_residuals,
                         int delta_mode, int coarse_samples, int fine_samples) {
+    // Next: prepare_residuals()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/pipeline.cu)
+    // completes preprocessing by padding, rotating, and optionally subtracting a centroid.
     prepare_residuals(res, d_data, N, dim, rotator, d_centroid, d_rotated_centroid,
                       d_residuals, /*require_rotated_c=*/false);
+    // Next: quantize_fused_on_residuals()
+    // (/home/achakroborti1/data-compressors/EmbdC/cuvs_rabitq/cpp/src/preprocessing/quantize/detail/rabitq/quantize.cu)
+    // completes RaBitQ compression by producing codes and per-row delta/vl values.
     quantize_fused_on_residuals(
         raft::resource::get_cuda_stream(res),
         d_residuals, N, static_cast<size_t>(rotator.padded_dim), ex_bits,
