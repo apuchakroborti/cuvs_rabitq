@@ -182,6 +182,14 @@ include(cmake/modules/ConfigureCUDA.cmake)
 # add third party dependencies using CPM
 rapids_cpm_init()
 
+# This source snapshot uses rmm::cuda_stream_view. Moving-main RAFT/RMM
+# revisions have removed that API; keep their headers and libraries together
+# at compatible snapshots rather than silently mixing API generations.
+include(${rapids-cmake-dir}/cpm/package_override.cmake)
+rapids_cpm_package_override(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/stream_api_dependencies.json"
+)
+
 if(NOT BUILD_CPU_ONLY)
   # We must find CCCL ourselves before raft so that we get the right version.
   include(${rapids-cmake-dir}/cpm/cccl.cmake)

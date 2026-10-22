@@ -15,7 +15,7 @@
 #include "tight_start_constants.cuh"
 #include "reductions.cuh"
 
-#include <cub/cub.cuh>
+#include <cub/device/device_reduce.cuh>
 #include <curand_kernel.h>
 #include <cuda_runtime.h>
 

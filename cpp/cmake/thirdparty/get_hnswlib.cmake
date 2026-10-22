@@ -32,9 +32,15 @@ function(find_and_configure_hnswlib)
   rapids_cpm_display_patch_status(hnswlib)
 
   if(NOT TARGET hnswlib::hnswlib)
-    add_library(hnswlib INTERFACE )
+    # Some CPM/FetchContent versions configure hnswlib despite DOWNLOAD_ONLY.
+    # Reuse its upstream target and provide only the missing namespaced alias.
+    if(NOT TARGET hnswlib)
+      add_library(hnswlib INTERFACE)
+    endif()
     add_library(hnswlib::hnswlib ALIAS hnswlib)
-    target_include_directories(hnswlib INTERFACE
+    # Upstream uses a source-tree include path that cannot be installed/exported.
+    # Replace it with relocatable build/install interfaces in either case.
+    set_property(TARGET hnswlib PROPERTY INTERFACE_INCLUDE_DIRECTORIES
      "$<BUILD_INTERFACE:${hnswlib_SOURCE_DIR}>"
      "$<INSTALL_INTERFACE:include>")
   endif()
