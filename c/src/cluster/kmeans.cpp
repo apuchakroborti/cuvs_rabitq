@@ -4,6 +4,7 @@
  */
 
 #include <cstdint>
+#include <optional>
 
 #include <dlpack/dlpack.h>
 
@@ -114,9 +115,10 @@ void _fit(cuvsResources_t res,
       } else {
         auto kmeans_params = convert_balanced_params(params);
         T inertia_temp;
-        auto inertia_view = raft::make_host_scalar_view<T>(&inertia_temp);
-        cuvs::cluster::kmeans::fit(*res_ptr, kmeans_params, cuvs::core::from_dlpack<const_mdspan_type>(X_tensor), cuvs::core::from_dlpack<mdspan_type>(centroids_tensor), std::make_optional(inertia_view));
-        *inertia = inertia_temp;
+        std::optional<raft::host_scalar_view<T>> inertia_view;
+        if (inertia != nullptr) inertia_view = raft::make_host_scalar_view<T>(&inertia_temp);
+        cuvs::cluster::kmeans::fit(*res_ptr, kmeans_params, cuvs::core::from_dlpack<const_mdspan_type>(X_tensor), cuvs::core::from_dlpack<mdspan_type>(centroids_tensor), inertia_view);
+        if (inertia != nullptr) *inertia = inertia_temp;
         *n_iter  = params.hierarchical_n_iters;
       }
     } else {
@@ -272,6 +274,25 @@ extern "C" cuvsError_t cuvsKMeansFit(cuvsResources_t res,
                 dataset.dtype.code,
                 dataset.dtype.bits);
     }
+  });
+}
+
+extern "C" cuvsError_t cuvsKMeansFitWithoutInertia(cuvsResources_t res,
+                                                cuvsKMeansParams_t params,
+                                                DLManagedTensor* X,
+                                                DLManagedTensor* centroids,
+                                                int* n_iter)
+{
+  return cuvs::core::translate_exceptions([=] {
+    RAFT_EXPECTS(params != nullptr && X != nullptr && centroids != nullptr && n_iter != nullptr,
+                 "Balanced KMeans requires non-null parameters, tensors and iteration output");
+    RAFT_EXPECTS(params->hierarchical, "FitWithoutInertia requires hierarchical KMeans");
+    const auto& dataset = X->dl_tensor;
+    RAFT_EXPECTS(cuvs::core::is_dlpack_device_compatible(dataset),
+                 "FitWithoutInertia requires device data");
+    RAFT_EXPECTS(dataset.dtype.code == kDLFloat && dataset.dtype.bits == 32,
+                 "FitWithoutInertia requires float32 data");
+    _fit<float>(res, *params, X, nullptr, centroids, nullptr, n_iter);
   });
 }
 

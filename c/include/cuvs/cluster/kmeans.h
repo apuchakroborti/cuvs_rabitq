@@ -301,6 +301,26 @@ CUVS_EXPORT cuvsError_t cuvsKMeansFit(cuvsResources_t res,
                           int* n_iter);
 
 /**
+ * @brief Fit device-resident float32 balanced KMeans without computing inertia.
+ *
+ * Additive entry point for callers that only need centroids. Requires
+ * params->hierarchical = true. Uses the same balanced fitting algorithm as
+ * cuvsKMeansFit, omitting its final diagnostic cluster-cost calculation.
+ * Existing cuvsKMeansFit callers retain their inertia output and behavior.
+ *
+ * @param[in]    res        Opaque resource handle.
+ * @param[in]    params     Balanced KMeans parameters.
+ * @param[in]    X          Device float32 row-major training matrix.
+ * @param[out]   centroids  Device float32 row-major cluster-center matrix.
+ * @param[out]   n_iter     Number of training iterations.
+ */
+CUVS_EXPORT cuvsError_t cuvsKMeansFitWithoutInertia(cuvsResources_t res,
+                                                 cuvsKMeansParams_t params,
+                                                 DLManagedTensor* X,
+                                                 DLManagedTensor* centroids,
+                                                 int* n_iter);
+
+/**
  * @brief Find clusters with k-means algorithm (v2 params layout).
  *
  * Mirrors cuvsKMeansFit but takes cuvsKMeansParams_v2_t. Will become the
