@@ -76,34 +76,37 @@ result build_profiled(
     std::min(static_cast<size_t>(n_rows),
              static_cast<size_t>(params.max_train_points_per_cluster) * params.n_lists);
 
-  // Step 5: Allocate the training matrix and sample dataset rows using seed 137.
-  // Allocation is included in total_ms, but occurs outside training_sample_ms.
-  auto trainset = raft::make_device_matrix<float, int64_t>(handle, n_rows_train, dim);
-  measured.training_sample_ms = time_stage(handle, [&] {
-    raft::random::RngState random_state{137};
-    raft::matrix::sample_rows<float, int64_t>(handle, random_state, dataset, trainset.view());
-  });
+  // Match upstream's training scope: release the sample before index allocation.
+  {
+    // Step 5: Allocate the training matrix and sample dataset rows using seed 137.
+    // Allocation is included in total_ms, but occurs outside training_sample_ms.
+    auto trainset = raft::make_device_matrix<float, int64_t>(handle, n_rows_train, dim);
+    measured.training_sample_ms = time_stage(handle, [&] {
+      raft::random::RngState random_state{137};
+      raft::matrix::sample_rows<float, int64_t>(handle, random_state, dataset, trainset.view());
+    });
 
-  // Step 6: Configure balanced k-means with the requested iteration count and
-  // expanded squared Euclidean distance, then train centers on the sampled rows.
-  cuvs::cluster::kmeans::balanced_params kmeans_params;
-  kmeans_params.n_iters = params.kmeans_n_iters;
-  kmeans_params.metric  = cuvs::distance::DistanceType::L2Expanded;
-  auto centers_view = raft::make_device_matrix_view<float, int64_t>(
-    centers.data(), params.n_lists, dim);
-  measured.balanced_kmeans_ms = time_stage(handle, [&] {
-    cuvs::cluster::kmeans::fit(
-      handle, kmeans_params, raft::make_const_mdspan(trainset.view()), centers_view);
-  });
+    // Step 6: Configure balanced k-means with the requested iteration count and
+    // expanded squared Euclidean distance, then train centers on the sampled rows.
+    cuvs::cluster::kmeans::balanced_params kmeans_params;
+    kmeans_params.n_iters = params.kmeans_n_iters;
+    kmeans_params.metric  = cuvs::distance::DistanceType::L2Expanded;
+    auto centers_view = raft::make_device_matrix_view<float, int64_t>(
+      centers.data(), params.n_lists, dim);
+    measured.balanced_kmeans_ms = time_stage(handle, [&] {
+      cuvs::cluster::kmeans::fit(
+        handle, kmeans_params, raft::make_const_mdspan(trainset.view()), centers_view);
+    });
 
-  // Step 7: Assign every dataset row to a cluster using the trained centers.
-  // These views reference the existing device buffers without copying their data.
-  auto labels_view = raft::make_device_vector_view<uint32_t, int64_t>(labels.data(), n_rows);
-  auto centers_const_view = raft::make_device_matrix_view<const float, int64_t>(
-    centers.data(), params.n_lists, dim);
-  measured.assignment_ms = time_stage(handle, [&] {
-    cuvs::cluster::kmeans::predict(handle, kmeans_params, dataset, centers_const_view, labels_view);
-  });
+    // Step 7: Assign every dataset row to a cluster using the trained centers.
+    // These views reference the existing device buffers without copying their data.
+    auto labels_view = raft::make_device_vector_view<uint32_t, int64_t>(labels.data(), n_rows);
+    auto centers_const_view = raft::make_device_matrix_view<const float, int64_t>(
+      centers.data(), params.n_lists, dim);
+    measured.assignment_ms = time_stage(handle, [&] {
+      cuvs::cluster::kmeans::predict(handle, kmeans_params, dataset, centers_const_view, labels_view);
+    });
+  }
 
   // Step 8: Construct the index inside the timed stage. The optional holds the
   // resulting index so the following stage can populate it.
